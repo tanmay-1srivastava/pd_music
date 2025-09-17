@@ -533,7 +533,7 @@ class GaitAnalyzer:
         
         return np.array(filtered_events)
     
-    def calculate_step_parameters(self, gait_events, sampling_rate):
+    def calculate_step_parameters(self, gait_events, sampling_rate, accelerometer_data=None):
         """Calculate step and stride parameters with enhanced outlier filtering"""
         heel_strikes = gait_events['heel_strikes']
         
