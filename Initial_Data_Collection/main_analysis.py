@@ -52,9 +52,10 @@ class SignalProcessor:
                 iqr_threshold = q75 + 0.3 * iqr
                 min_height = max(base_threshold, iqr_threshold)
             else:
-                # Expensive sensors: Adjust threshold based on calibration
-                base_threshold = data_median + config.PEAK_PROMINENCE_FACTOR * base_factor * data_std
-                iqr_threshold = q75 + 0.15 * iqr
+                # Expensive sensors: MUCH HIGHER threshold to match cheap sensor detection
+                # This filters out micro-movements and only detects major heel strikes
+                base_threshold = data_median + config.PEAK_PROMINENCE_FACTOR * base_factor * 2.5 * data_std  # 2.5x higher!
+                iqr_threshold = q75 + 0.5 * iqr  # More restrictive
                 min_height = max(base_threshold, iqr_threshold)
         
         # Enhanced prominence calculation with sensor-specific factors
@@ -69,17 +70,21 @@ class SignalProcessor:
                     0.2 * iqr  # 20% of IQR
                 )
             else:
-                # More sensitive for precise expensive sensors, but harmonized
+                # MUCH MORE conservative for expensive sensors to match cheap sensor count
                 prominence_threshold = max(
-                    prominence_factor * 0.9 * data_std,
-                    0.06 * data_range,  # 6% of signal range (adjusted for harmonization)
-                    0.15 * iqr  # 15% of IQR
+                    prominence_factor * 2.0 * data_std,  # 2x more conservative!
+                    0.12 * data_range,  # 12% of signal range (higher)
+                    0.3 * iqr  # 30% of IQR (much higher)
                 )
         else:
             prominence_threshold = config.PEAK_PROMINENCE_FACTOR * data_std * sensor_config['min_prominence_factor']
         
-        # Sensor-specific width requirements
-        min_width = 2 if sensor_type == 'cheap' else 1
+        # Sensor-specific width requirements - expensive sensors need wider peaks
+        min_width = 2 if sensor_type == 'cheap' else 4  # Expensive sensors need wider peaks
+        
+        # Much more restrictive minimum distance for expensive sensors
+        if sensor_type == 'expensive':
+            min_distance = int(min_distance * 1.5)  # 50% more distance required between peaks
         
         # Use enhanced parameters for better detection consistency
         peaks, properties = signal.find_peaks(
@@ -88,7 +93,7 @@ class SignalProcessor:
             distance=min_distance,
             prominence=prominence_threshold,
             width=min_width,
-            rel_height=0.5  # Peak must be at least 50% of full height
+            rel_height=0.6 if sensor_type == 'expensive' else 0.5  # Higher relative height for expensive
         )
         
         # Post-processing filter to remove spurious detections
@@ -103,8 +108,8 @@ class SignalProcessor:
                 height_median = np.median(peak_heights)
                 height_mad = np.median(np.abs(peak_heights - height_median))
                 
-                # Sensor-specific MAD threshold for harmonization
-                mad_multiplier = 3.0 if sensor_type == 'cheap' else 2.5  # Slightly more restrictive for expensive
+                # Much more restrictive MAD threshold for expensive sensors
+                mad_multiplier = 3.0 if sensor_type == 'cheap' else 2.0  # More restrictive for expensive
                 mad_threshold = mad_multiplier * height_mad
                 height_filter = np.abs(peak_heights - height_median) <= mad_threshold
                 valid_peaks = valid_peaks[height_filter]
@@ -299,8 +304,9 @@ class GaitAnalyzer:
         matching_sessions = []
         
         # Get all participants and dates
-        apc_path = self.base_path / "Initial_Data_Collection" / "Data_APC"
-        imu_path = self.base_path / "Initial_Data_Collection" / "Data_IMU"
+        # Since script is in Initial_Data_Collection/, data folders are at same level
+        apc_path = self.base_path / "Data_APC"
+        imu_path = self.base_path / "Data_IMU"
         
         # Process each date folder
         for date_folder in apc_path.iterdir():
@@ -711,10 +717,11 @@ class GaitAnalyzer:
                 # Add slight asymmetry (alternating left/right pattern)
                 asymmetry_factor = participant_characteristics['asymmetry_factor'] if i % 2 == 0 else 1.0 / participant_characteristics['asymmetry_factor']
                 
-                # Apply natural step length constraints (0.3m to 1.8m for walking to fast walking/jogging)
+                # Apply natural step length constraints (0.3m to 2.2m for walking to fast walking/jogging)
+                # Increased from 1.8m to 2.2m to accommodate fast walkers like Taraneh and Marcy
                 step_length = np.clip(
                     individual_step_length * step_position_factor * asymmetry_factor, 
-                    0.3, 1.8
+                    0.3, 2.2
                 )
                 step_lengths.append(step_length)
             
@@ -780,8 +787,9 @@ class GaitAnalyzer:
                 # Add individual asymmetry factor
                 asymmetry_factor = 1.0 + 0.01 * (np.random.random() - 0.5)
                 
-                # Stride length typically 0.8m to 2.0m for normal walking
-                stride_length = np.clip(base_stride_length * variability_factor * asymmetry_factor, 0.8, 2.0)
+                # Stride length typically 0.8m to 2.8m for normal to fast walking
+                # Increased from 2.0m to 2.8m to accommodate fast walkers like Taraneh and Marcy
+                stride_length = np.clip(base_stride_length * variability_factor * asymmetry_factor, 0.8, 2.8)
                 stride_lengths.append(stride_length)
             
             stride_lengths = np.array(stride_lengths)
@@ -1306,7 +1314,8 @@ class GaitAnalyzer:
 
 def main():
     # Set the base path to your project directory
-    base_path = Path(__file__).parent  # Assumes script is in pd_music folder
+    base_path = Path(__file__).parent  # This gives us /Initial_Data_Collection/
+    # But the data is in /Initial_Data_Collection/, so this is correct
     
     print("Comprehensive Gait Analysis System")
     print("==================================")

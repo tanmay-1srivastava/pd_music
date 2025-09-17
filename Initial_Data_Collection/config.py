@@ -21,10 +21,10 @@ class GaitAnalysisConfig:
         },
         'expensive': {
             'noise_factor': 0.8,         # Lower noise expectation  
-            'threshold_multiplier': 0.6,  # Lower thresholds sufficient
+            'threshold_multiplier': 1.2,  # HIGHER thresholds to match cheap sensor detection
             'filtering_strength': 0.9,    # Gentler filtering
-            'min_prominence_factor': 0.9,  # Lower prominence sufficient
-            'peak_sensitivity': 1.2,      # Higher sensitivity for clean signals
+            'min_prominence_factor': 1.5,  # HIGHER prominence to filter micro-movements
+            'peak_sensitivity': 0.6,      # LOWER sensitivity to detect only major steps
             'step_time_correction': 1.0,  # No correction needed
             'amplitude_scaling': 1.0      # Normalization handles this
         }
