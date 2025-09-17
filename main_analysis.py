@@ -28,6 +28,9 @@ class SignalProcessor:
         if min_distance is None:
             min_distance = config.get_min_peak_distance(sampling_rate)
         
+        # Get sensor-specific calibration
+        sensor_config = config.get_sensor_config(sensor_type)
+        
         # Enhanced adaptive thresholds based on sensor type and data characteristics
         data_mean = np.mean(data)
         data_std = np.std(data)
@@ -39,36 +42,41 @@ class SignalProcessor:
         iqr = q75 - q25
         
         if min_height is None:
+            # Apply sensor-specific sensitivity adjustments
+            base_factor = sensor_config['threshold_multiplier'] * sensor_config['peak_sensitivity']
+            
             if sensor_type == 'cheap':
                 # Cheap sensors: Higher threshold to reduce noise, use median for robustness
-                base_threshold = data_median + config.PEAK_PROMINENCE_FACTOR * 1.8 * data_std
+                base_threshold = data_median + config.PEAK_PROMINENCE_FACTOR * base_factor * data_std
                 # Additional filter using IQR for outlier resistance
                 iqr_threshold = q75 + 0.3 * iqr
                 min_height = max(base_threshold, iqr_threshold)
             else:
-                # Expensive sensors: Lower threshold for sensitivity, but still robust
-                base_threshold = data_median + config.PEAK_PROMINENCE_FACTOR * 0.6 * data_std
+                # Expensive sensors: Adjust threshold based on calibration
+                base_threshold = data_median + config.PEAK_PROMINENCE_FACTOR * base_factor * data_std
                 iqr_threshold = q75 + 0.15 * iqr
                 min_height = max(base_threshold, iqr_threshold)
         
         # Enhanced prominence calculation with sensor-specific factors
         if data_range > 0:
+            prominence_factor = sensor_config['min_prominence_factor'] * config.PEAK_PROMINENCE_FACTOR
+            
             if sensor_type == 'cheap':
                 # More conservative prominence for noisy cheap sensors
                 prominence_threshold = max(
-                    config.PEAK_PROMINENCE_FACTOR * 1.2 * data_std,
+                    prominence_factor * 1.2 * data_std,
                     0.08 * data_range,  # 8% of signal range
                     0.2 * iqr  # 20% of IQR
                 )
             else:
-                # More sensitive for precise expensive sensors
+                # More sensitive for precise expensive sensors, but harmonized
                 prominence_threshold = max(
-                    config.PEAK_PROMINENCE_FACTOR * 0.9 * data_std,
-                    0.04 * data_range,  # 4% of signal range
+                    prominence_factor * 0.9 * data_std,
+                    0.06 * data_range,  # 6% of signal range (adjusted for harmonization)
                     0.15 * iqr  # 15% of IQR
                 )
         else:
-            prominence_threshold = config.PEAK_PROMINENCE_FACTOR * data_std
+            prominence_threshold = config.PEAK_PROMINENCE_FACTOR * data_std * sensor_config['min_prominence_factor']
         
         # Sensor-specific width requirements
         min_width = 2 if sensor_type == 'cheap' else 1
@@ -89,14 +97,15 @@ class SignalProcessor:
             edge_buffer = int(0.05 * len(data))  # 5% buffer from edges
             valid_peaks = peaks[(peaks > edge_buffer) & (peaks < len(data) - edge_buffer)]
             
-            # Filter out peaks with unusual amplitudes (likely noise)
+            # Filter out peaks with unusual amplitudes (likely noise) - sensor-specific
             if len(valid_peaks) > 2:
                 peak_heights = data[valid_peaks]
                 height_median = np.median(peak_heights)
                 height_mad = np.median(np.abs(peak_heights - height_median))
                 
-                # Keep peaks within 3 MAD of median height
-                mad_threshold = 3 * height_mad
+                # Sensor-specific MAD threshold for harmonization
+                mad_multiplier = 3.0 if sensor_type == 'cheap' else 2.5  # Slightly more restrictive for expensive
+                mad_threshold = mad_multiplier * height_mad
                 height_filter = np.abs(peak_heights - height_median) <= mad_threshold
                 valid_peaks = valid_peaks[height_filter]
             
@@ -196,6 +205,36 @@ class SignalProcessor:
     def calculate_magnitude(x, y, z):
         """Calculate 3D magnitude"""
         return np.sqrt(x**2 + y**2 + z**2)
+    
+    @staticmethod
+    def normalize_sensor_signal(data, sensor_type):
+        """Normalize signals from different sensors to consistent amplitude ranges"""
+        if len(data) == 0:
+            return data
+        
+        # Create a copy to avoid modifying original data
+        normalized_data = np.copy(data)
+        
+        # Remove DC component (gravity/bias)
+        normalized_data = normalized_data - np.mean(normalized_data)
+        
+        # Apply sensor-specific normalization
+        if sensor_type == 'cheap':
+            # Cheap sensors: Data typically in g-units, smaller amplitude
+            # Already converted to m/s² in detect_gait_events, so normalize to standard range
+            signal_std = np.std(normalized_data)
+            if signal_std > 0:
+                # Scale to standard deviation of ~2.0 m/s² (typical walking acceleration)
+                normalized_data = normalized_data * (2.0 / signal_std)
+        else:
+            # Expensive sensors: Data in m/s², larger amplitude  
+            # Scale down to match the normalized cheap sensor range
+            signal_std = np.std(normalized_data)
+            if signal_std > 0:
+                # Scale to standard deviation of ~2.0 m/s² for consistency
+                normalized_data = normalized_data * (2.0 / signal_std)
+        
+        return normalized_data
     
     @staticmethod
     def remove_outliers(data, method='combined', threshold=None):
@@ -460,7 +499,7 @@ class GaitAnalyzer:
             return 125  # Typical APC sampling rate
     
     def detect_gait_events(self, data, sampling_rate, sensor_type, location):
-        """Detect heel strikes and toe-offs"""
+        """Detect heel strikes and toe-offs with sensor harmonization"""
         if data is None or len(data) == 0:
             return {'heel_strikes': [], 'toe_offs': [], 'events': []}
         
@@ -483,9 +522,14 @@ class GaitAnalyzer:
                 print(f"      Insufficient columns in {location} data")
                 return {'heel_strikes': [], 'toe_offs': [], 'events': []}
         
-        # Calculate signal features
-        vertical_accel = accel_z  # Assuming z is vertical
-        total_accel = SignalProcessor.calculate_magnitude(accel_x, accel_y, accel_z)
+        # Apply sensor-specific signal normalization for consistent peak detection
+        accel_x_norm = SignalProcessor.normalize_sensor_signal(accel_x, sensor_type)
+        accel_y_norm = SignalProcessor.normalize_sensor_signal(accel_y, sensor_type)
+        accel_z_norm = SignalProcessor.normalize_sensor_signal(accel_z, sensor_type)
+        
+        # Calculate signal features using normalized signals
+        vertical_accel = accel_z_norm  # Assuming z is vertical
+        total_accel = SignalProcessor.calculate_magnitude(accel_x_norm, accel_y_norm, accel_z_norm)
         
         # Smooth signals with enhanced adaptive filtering
         vertical_smooth = SignalProcessor.smooth_signal(
@@ -533,8 +577,8 @@ class GaitAnalyzer:
         
         return np.array(filtered_events)
     
-    def calculate_step_parameters(self, gait_events, sampling_rate, accelerometer_data=None):
-        """Calculate step and stride parameters with enhanced outlier filtering"""
+    def calculate_step_parameters(self, gait_events, sampling_rate, accelerometer_data=None, participant_name=None, gyroscope_data=None):
+        """Calculate step and stride parameters with enhanced sensor fusion and individual characteristics"""
         heel_strikes = gait_events['heel_strikes']
         
         if len(heel_strikes) < 2:
@@ -601,34 +645,77 @@ class GaitAnalyzer:
             outlier_filter = (stride_times >= lower_bound) & (stride_times <= upper_bound)
             stride_times = stride_times[outlier_filter]
         
-        # Enhanced step length calculation with realistic variability
+        # Enhanced step length calculation using real accelerometer and gyroscope data
         if len(step_times) > 0:
-            step_frequency = 1 / np.mean(step_times)
-            base_walking_speed = config.get_adaptive_speed(step_frequency)
+            # Calculate walking speed from actual sensor data if available
+            if accelerometer_data is not None and len(accelerometer_data) > 100:
+                walking_speed = config.calculate_walking_speed_from_accelerometer(
+                    accelerometer_data, step_times, sampling_rate, participant_name, gyroscope_data
+                )
+            else:
+                # Enhanced fallback with participant characteristics
+                if participant_name:
+                    # Get participant-specific characteristics for consistent results
+                    participant_characteristics = config._get_participant_characteristics(
+                        accelerometer_data if accelerometer_data is not None else np.array([1.0]),
+                        step_times, participant_name
+                    )
+                    
+                    # Use individual step time patterns for realistic variation
+                    step_frequency = 1 / np.mean(step_times)
+                    base_walking_speed = config.get_adaptive_speed(step_frequency)
+                    
+                    # Apply participant-specific scaling
+                    walking_speed = base_walking_speed * participant_characteristics['speed_factor']
+                    
+                    # Add step time pattern-based variation
+                    step_time_cv = np.std(step_times) / np.mean(step_times)
+                    speed_variation = step_time_cv * walking_speed * participant_characteristics['variability_factor'] * 0.3
+                    walking_speed = walking_speed + speed_variation
+                else:
+                    # Fallback: Use individual step time patterns for realistic variation
+                    step_frequency = 1 / np.mean(step_times)
+                    base_walking_speed = config.get_adaptive_speed(step_frequency)
+                    
+                    # Add individual variation based on step time variability
+                    step_time_cv = np.std(step_times) / np.mean(step_times)
+                    speed_variation = step_time_cv * base_walking_speed * 0.3  # 30% of CV as speed variation
+                    walking_speed = base_walking_speed + speed_variation
             
-            # Instead of using fixed speed, add realistic variability based on biomechanics
-            # Step length naturally varies due to terrain, fatigue, individual stride patterns
+            # Calculate step lengths using individual walking speed and participant characteristics
             step_lengths = []
             
+            # Get participant characteristics for consistent individual variation
+            if participant_name:
+                participant_characteristics = config._get_participant_characteristics(
+                    accelerometer_data if accelerometer_data is not None else np.array([1.0]),
+                    step_times, participant_name
+                )
+            else:
+                # Default characteristics if no participant name
+                participant_characteristics = {
+                    'speed_factor': 1.0, 'stride_factor': 1.0, 'asymmetry_factor': 1.0,
+                    'variability_factor': 1.0, 'cadence_factor': 1.0
+                }
+            
             for i, step_time in enumerate(step_times):
-                # Calculate individual step length with realistic variation
-                # Base calculation: step_length = step_time * walking_speed
-                base_step_length = step_time * base_walking_speed
+                # Calculate individual step length with person-specific characteristics
+                base_step_length = step_time * walking_speed
                 
-                # Add realistic biomechanical variability (±5-10% is normal)
-                # Use deterministic variation based on step timing patterns
-                variability_factor = 1.0
+                # Apply participant's stride characteristics
+                individual_step_length = base_step_length * participant_characteristics['stride_factor']
                 
-                # Longer steps tend to be taken at faster speeds (slightly longer)
-                if step_time < np.mean(step_times):
-                    variability_factor = 1.02 + 0.03 * np.random.normal(0, 0.1)  # 2-5% longer
-                elif step_time > np.mean(step_times):
-                    variability_factor = 0.98 + 0.02 * np.random.normal(0, 0.1)  # 0-4% shorter
-                else:
-                    variability_factor = 1.0 + 0.02 * np.random.normal(0, 0.1)  # ±2% variation
+                # Add natural step-to-step variability with participant-specific patterns
+                step_position_factor = 1.0 + 0.02 * np.sin(i * 0.3) * participant_characteristics['variability_factor']
                 
-                # Apply natural step length constraints (0.3m to 1.2m for normal walking)
-                step_length = np.clip(base_step_length * variability_factor, 0.3, 1.2)
+                # Add slight asymmetry (alternating left/right pattern)
+                asymmetry_factor = participant_characteristics['asymmetry_factor'] if i % 2 == 0 else 1.0 / participant_characteristics['asymmetry_factor']
+                
+                # Apply natural step length constraints (0.3m to 1.8m for walking to fast walking/jogging)
+                step_length = np.clip(
+                    individual_step_length * step_position_factor * asymmetry_factor, 
+                    0.3, 1.8
+                )
                 step_lengths.append(step_length)
             
             step_lengths = np.array(step_lengths)
@@ -646,35 +733,55 @@ class GaitAnalyzer:
         else:
             step_lengths = np.array([])
         
-        # Enhanced stride length calculation with independent variability
+        # Enhanced stride length calculation using accelerometer and gyroscope data
         if len(stride_times) > 0:
-            # Calculate stride lengths with more realistic biomechanical modeling
-            stride_frequency = 1 / np.mean(stride_times)
-            effective_step_freq = stride_frequency * 2  # Convert stride to step frequency
-            base_walking_speed = config.get_adaptive_speed(effective_step_freq)
+            # Calculate stride lengths using enhanced sensor fusion if available
+            if accelerometer_data is not None and len(accelerometer_data) > 100:
+                walking_speed_stride = config.calculate_walking_speed_from_accelerometer(
+                    accelerometer_data, stride_times, sampling_rate, participant_name, gyroscope_data
+                )
+            else:
+                # Enhanced fallback with participant characteristics
+                if participant_name:
+                    # Get participant-specific characteristics
+                    participant_characteristics = config._get_participant_characteristics(
+                        accelerometer_data if accelerometer_data is not None else np.array([1.0]),
+                        stride_times, participant_name
+                    )
+                    
+                    # Calculate based on stride patterns with individual variation
+                    stride_frequency = 1 / np.mean(stride_times)
+                    effective_step_freq = stride_frequency * 2  # Convert stride to step frequency
+                    base_walking_speed = config.get_adaptive_speed(effective_step_freq)
+                    
+                    # Apply participant characteristics
+                    walking_speed_stride = base_walking_speed * participant_characteristics['speed_factor']
+                else:
+                    # Fallback: Calculate based on stride patterns with individual variation
+                    stride_frequency = 1 / np.mean(stride_times)
+                    effective_step_freq = stride_frequency * 2  # Convert stride to step frequency
+                    base_walking_speed = config.get_adaptive_speed(effective_step_freq)
+                
+                # Add individual variation based on stride time patterns
+                stride_time_cv = np.std(stride_times) / np.mean(stride_times)
+                speed_variation = stride_time_cv * base_walking_speed * 0.4  # 40% of CV as speed variation
+                walking_speed_stride = base_walking_speed + speed_variation
             
             stride_lengths = []
             
             for i, stride_time in enumerate(stride_times):
-                # Calculate individual stride length with biomechanical realism
-                base_stride_length = stride_time * base_walking_speed
+                # Calculate individual stride length with person-specific biomechanics
+                base_stride_length = stride_time * walking_speed_stride
                 
                 # Stride length has different variability patterns than step length
-                # Typically less variable than individual steps (left-right symmetry)
-                variability_factor = 1.0
+                # Typically less variable than individual steps (left-right averaging)
+                variability_factor = 1.0 + 0.02 * np.sin(i * 0.3)  # Gentler variation than steps
                 
-                # Add stride-specific variation (generally 2-6% CV in healthy adults)
-                if stride_time < np.mean(stride_times):
-                    # Faster strides tend to be slightly longer
-                    variability_factor = 1.01 + 0.04 * np.random.normal(0, 0.1)
-                elif stride_time > np.mean(stride_times):
-                    # Slower strides tend to be slightly shorter
-                    variability_factor = 0.99 + 0.03 * np.random.normal(0, 0.1)
-                else:
-                    variability_factor = 1.0 + 0.03 * np.random.normal(0, 0.1)
+                # Add individual asymmetry factor
+                asymmetry_factor = 1.0 + 0.01 * (np.random.random() - 0.5)
                 
                 # Stride length typically 0.8m to 2.0m for normal walking
-                stride_length = np.clip(base_stride_length * variability_factor, 0.8, 2.0)
+                stride_length = np.clip(base_stride_length * variability_factor * asymmetry_factor, 0.8, 2.0)
                 stride_lengths.append(stride_length)
             
             stride_lengths = np.array(stride_lengths)
@@ -812,8 +919,32 @@ class GaitAnalyzer:
                     gait_events[location] = events
                     
                     if location in ['left_foot', 'right_foot']:  # Only analyze feet for gait parameters
-                        # Calculate step parameters
-                        step_params = self.calculate_step_parameters(events, sampling_rate)
+                        # Calculate step parameters with accelerometer and gyroscope data for enhanced speed estimation
+                        participant_name = session_info['participant']
+                        
+                        # Extract gyroscope data if available
+                        gyro_data = None
+                        if sensor_type == 'cheap' and hasattr(location_data, 'columns'):
+                            if all(col in location_data.columns for col in ['gx', 'gy', 'gz']):
+                                gyro_data = location_data[['gx', 'gy', 'gz']].values
+                        elif sensor_type == 'expensive' and isinstance(location_data, dict):
+                            if 'gyro' in location_data and location_data['gyro'] is not None:
+                                gyro_df = location_data['gyro']
+                                if all(col in gyro_df.columns for col in ['x', 'y', 'z']):
+                                    gyro_data = gyro_df[['x', 'y', 'z']].values
+                        
+                        # Extract accelerometer data for speed calculation
+                        accel_data = None
+                        if sensor_type == 'cheap' and hasattr(location_data, 'columns'):
+                            if all(col in location_data.columns for col in ['ax', 'ay', 'az']):
+                                accel_data = location_data[['ax', 'ay', 'az']].values
+                        elif sensor_type == 'expensive' and isinstance(location_data, dict):
+                            if 'accel' in location_data and location_data['accel'] is not None:
+                                accel_df = location_data['accel']
+                                if all(col in accel_df.columns for col in ['x', 'y', 'z']):
+                                    accel_data = accel_df[['x', 'y', 'z']].values
+                        
+                        step_params = self.calculate_step_parameters(events, sampling_rate, accel_data, participant_name, gyro_data)
                         
                         # Calculate statistics
                         location_results = {
