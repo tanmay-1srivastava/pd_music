@@ -1021,8 +1021,120 @@ class GaitAnalyzer:
         
         return session_results
     
-    def create_session_plots(self, session_results, output_dir):
-        """Create plots for a session"""
+    def calculate_global_data_ranges(self):
+        """Calculate global min/max values across all sessions for consistent plot scaling"""
+        global_ranges = {
+            'step_length': {'min': float('inf'), 'max': float('-inf')},
+            'stride_length': {'min': float('inf'), 'max': float('-inf')},
+            'step_time': {'min': float('inf'), 'max': float('-inf')},
+            'stride_time': {'min': float('inf'), 'max': float('-inf')},
+            'gait_velocity': {'min': float('inf'), 'max': float('-inf')},
+            'double_support': {'min': float('inf'), 'max': float('-inf')}
+        }
+        
+        # Analyze all existing session files
+        session_files = list((self.results_dir / "individual_sessions").glob("*.json"))
+        
+        if not session_files:
+            # If no existing session files, return default ranges
+            return {
+                'step_length': {'min': 0.3, 'max': 2.2},
+                'stride_length': {'min': 0.8, 'max': 2.8},
+                'step_time': {'min': 0.3, 'max': 1.2},
+                'stride_time': {'min': 1.0, 'max': 2.5},
+                'gait_velocity': {'min': 0.5, 'max': 3.0},
+                'double_support': {'min': 0.05, 'max': 0.4}
+            }
+        
+        for session_file in session_files:
+            try:
+                with open(session_file, 'r') as f:
+                    session_data = json.load(f)
+                
+                # Check both sensor types
+                for sensor_type in ['cheap_sensor', 'expensive_sensor']:
+                    sensor_data = session_data.get(sensor_type, {})
+                    
+                    # Individual foot data
+                    for foot in ['left_foot', 'right_foot']:
+                        foot_data = sensor_data.get(foot, {})
+                        
+                        # Update ranges for step and stride parameters
+                        for param_type in ['step_length_stats', 'stride_length_stats', 
+                                         'step_time_stats', 'stride_time_stats']:
+                            stats = foot_data.get(param_type, {})
+                            if 'min' in stats and 'max' in stats and stats['min'] > 0:
+                                param_key = param_type.replace('_stats', '')
+                                global_ranges[param_key]['min'] = min(global_ranges[param_key]['min'], stats['min'])
+                                global_ranges[param_key]['max'] = max(global_ranges[param_key]['max'], stats['max'])
+                    
+                    # Combined data
+                    combined_data = sensor_data.get('combined', {})
+                    
+                    # Gait velocity
+                    gait_vel_stats = combined_data.get('gait_velocity_stats', {})
+                    if 'min' in gait_vel_stats and 'max' in gait_vel_stats and gait_vel_stats['min'] > 0:
+                        global_ranges['gait_velocity']['min'] = min(global_ranges['gait_velocity']['min'], gait_vel_stats['min'])
+                        global_ranges['gait_velocity']['max'] = max(global_ranges['gait_velocity']['max'], gait_vel_stats['max'])
+                    
+                    # Double support time
+                    ds_stats = combined_data.get('double_support_stats', {})
+                    if 'min' in ds_stats and 'max' in ds_stats and ds_stats['min'] > 0:
+                        global_ranges['double_support']['min'] = min(global_ranges['double_support']['min'], ds_stats['min'])
+                        global_ranges['double_support']['max'] = max(global_ranges['double_support']['max'], ds_stats['max'])
+            
+            except Exception as e:
+                print(f"Warning: Error reading session file {session_file}: {e}")
+                continue
+        
+        # Replace infinite values with defaults if no valid data found
+        defaults = {
+            'step_length': {'min': 0.3, 'max': 2.2},
+            'stride_length': {'min': 0.8, 'max': 2.8},
+            'step_time': {'min': 0.3, 'max': 1.2},
+            'stride_time': {'min': 1.0, 'max': 2.5},
+            'gait_velocity': {'min': 0.5, 'max': 3.0},
+            'double_support': {'min': 0.05, 'max': 0.4}
+        }
+        
+        for param, ranges in global_ranges.items():
+            if ranges['min'] == float('inf') or ranges['max'] == float('-inf'):
+                global_ranges[param] = defaults[param]
+        
+        return global_ranges
+    
+    def get_plot_y_limits(self, param_type, global_ranges):
+        """Get consistent Y-axis limits for a specific parameter type"""
+        param_mapping = {
+            'step_length_stats': 'step_length',
+            'stride_length_stats': 'stride_length',
+            'step_time_stats': 'step_time',
+            'stride_time_stats': 'stride_time',
+            'gait_velocity_stats': 'gait_velocity',
+            'double_support_stats': 'double_support'
+        }
+        
+        param_key = param_mapping.get(param_type, param_type.replace('_stats', ''))
+        
+        if param_key in global_ranges:
+            min_val = global_ranges[param_key]['min']
+            max_val = global_ranges[param_key]['max']
+            
+            # Add 10% padding for visual clarity
+            padding = (max_val - min_val) * 0.1
+            y_min = max(0, min_val - padding)  # Don't go below 0
+            y_max = max_val + padding
+            
+            return y_min, y_max
+        
+        # Fallback defaults
+        return 0, 1
+
+    def create_session_plots(self, session_results, output_dir, global_ranges=None):
+        """Create plots for a session with consistent Y-axis scaling"""
+        if global_ranges is None:
+            global_ranges = self.calculate_global_data_ranges()
+        
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(f"Gait Analysis: {session_results['metadata']['participant']} - "
                     f"{session_results['metadata']['date']} - Session {session_results['metadata']['session']}")
@@ -1084,9 +1196,13 @@ class GaitAnalyzer:
             width = 0.35
             
             if cheap_data:
-                ax.bar(x - width/2, cheap_data, width, label='Cheap Sensor', color=config.COLORS['cheap'])
+                ax.bar(x - width/2, cheap_data, width, label='Mbient Sensor', color=config.COLORS['cheap'])
             if expensive_data:
                 ax.bar(x + width/2, expensive_data, width, label='Expensive Sensor', color=config.COLORS['expensive'])
+            
+            # Set consistent Y-axis limits
+            y_min, y_max = self.get_plot_y_limits(stat_key, global_ranges)
+            ax.set_ylim(y_min, y_max)
             
             ax.set_title(title)
             ax.set_ylabel(f'{title} ({unit})')
@@ -1099,7 +1215,7 @@ class GaitAnalyzer:
         plt.tight_layout()
         return fig
     
-    def save_session_results(self, session_results):
+    def save_session_results(self, session_results, global_ranges=None):
         """Save individual session results"""
         participant = session_results['metadata']['participant']
         date = session_results['metadata']['date']
@@ -1113,9 +1229,11 @@ class GaitAnalyzer:
         with open(filepath, 'w') as f:
             json.dump(session_results, f, indent=2, default=str)
         
-        # Create and save plots
+        # Create and save plots with consistent scaling
         try:
-            fig = self.create_session_plots(session_results, self.results_dir / "plots")
+            if global_ranges is None:
+                global_ranges = self.calculate_global_data_ranges()
+            fig = self.create_session_plots(session_results, self.results_dir / "plots", global_ranges)
             plot_filename = f"{participant}_{date.replace(' ', '_')}_Session_{session}_plots.png"
             plot_filepath = self.results_dir / "plots" / plot_filename
             fig.savefig(plot_filepath, dpi=config.DPI, bbox_inches='tight')
@@ -1216,21 +1334,24 @@ class GaitAnalyzer:
         return summary
     
     def create_summary_plots(self, summary):
-        """Create summary plots across all participants"""
+        """Create summary plots across all participants with consistent Y-axis scaling"""
+        # Calculate global ranges for consistent scaling
+        global_ranges = self.calculate_global_data_ranges()
+        
         # Overall statistics plot
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
         fig.suptitle("Overall Gait Analysis Summary - All Participants")
         
         plot_data = [
-            ('Step Length', 'step_lengths', 'm'),
-            ('Stride Length', 'stride_lengths', 'm'), 
-            ('Step Time', 'step_times', 's'),
-            ('Stride Time', 'stride_times', 's'),
-            ('Gait Velocity', 'gait_velocities', 'm/s'),
-            ('Double Support Time', 'double_support_times', 's')
+            ('Step Length', 'step_lengths', 'm', 'step_length_stats'),
+            ('Stride Length', 'stride_lengths', 'm', 'stride_length_stats'), 
+            ('Step Time', 'step_times', 's', 'step_time_stats'),
+            ('Stride Time', 'stride_times', 's', 'stride_time_stats'),
+            ('Gait Velocity', 'gait_velocities', 'm/s', 'gait_velocity_stats'),
+            ('Double Support Time', 'double_support_times', 's', 'double_support_stats')
         ]
         
-        for idx, (title, param, unit) in enumerate(plot_data):
+        for idx, (title, param, unit, stat_key) in enumerate(plot_data):
             row, col = idx // 3, idx % 3
             ax = axes[row, col]
             
@@ -1240,7 +1361,18 @@ class GaitAnalyzer:
                 values = [stats['mean'] - stats['std'], stats['mean'], stats['mean'] + stats['std']]
                 ax.bar(['Mean-SD', 'Mean', 'Mean+SD'], values, 
                        color=['lightblue', 'blue', 'lightblue'])
+                
+                # Set consistent Y-axis limits
+                y_min, y_max = self.get_plot_y_limits(stat_key, global_ranges)
+                ax.set_ylim(y_min, y_max)
+                
                 ax.set_title(f"{title}\nMean: {stats['mean']:.3f} ± {stats['std']:.3f} {unit}")
+                ax.set_ylabel(f"{title} ({unit})")
+            else:
+                # If no data, still set consistent limits and show empty plot
+                y_min, y_max = self.get_plot_y_limits(stat_key, global_ranges)
+                ax.set_ylim(y_min, y_max)
+                ax.set_title(f"{title}\nNo data available")
                 ax.set_ylabel(f"{title} ({unit})")
         
         plt.tight_layout()
@@ -1259,6 +1391,10 @@ class GaitAnalyzer:
         ax.set_ylabel("Gait Velocity (m/s)")
         ax.set_xlabel("Participant")
         
+        # Set consistent Y-axis limits for gait velocity
+        y_min, y_max = self.get_plot_y_limits('gait_velocity_stats', global_ranges)
+        ax.set_ylim(y_min, y_max)
+        
         # Add value labels on bars
         for bar, vel in zip(bars, gait_velocities):
             if vel > 0:
@@ -1272,6 +1408,9 @@ class GaitAnalyzer:
         plt.close(fig)
         
         print(f"Summary plots saved: {plot_file.name} and {participant_plot_file.name}")
+        print(f"Global ranges used for consistent scaling:")
+        for param, ranges in global_ranges.items():
+            print(f"  {param}: {ranges['min']:.3f} - {ranges['max']:.3f}")
     
     def run_complete_analysis(self):
         """Run complete analysis on all matching sessions"""
@@ -1289,11 +1428,18 @@ class GaitAnalyzer:
             print("No matching sessions found!")
             return
         
+        # Calculate global data ranges for consistent plot scaling
+        print("Calculating global data ranges for consistent plot scaling...")
+        global_ranges = self.calculate_global_data_ranges()
+        print("Global ranges calculated:")
+        for param, ranges in global_ranges.items():
+            print(f"  {param}: {ranges['min']:.3f} - {ranges['max']:.3f}")
+        
         # Process each session
         for session_info in matching_sessions:
             try:
                 session_results = self.analyze_session(session_info)
-                result_file = self.save_session_results(session_results)
+                result_file = self.save_session_results(session_results, global_ranges)
                 self.processed_sessions.append(result_file)
             except Exception as e:
                 print(f"  Error processing session: {e}")
@@ -1309,6 +1455,7 @@ class GaitAnalyzer:
             print(f"Individual session results: {self.results_dir / 'individual_sessions'}")
             print(f"Plots: {self.results_dir / 'plots'}")
             print(f"Summary: {self.results_dir / 'summary'}")
+            print("\nAll plots now use consistent Y-axis scales for proper comparison across users!")
         else:
             print("No sessions were successfully processed!")
 
